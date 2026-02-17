@@ -530,11 +530,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     let body = "";
+                    let bodyIsHtml = false;
                     try {
                       // sanitizeForJson removes control chars that break JSON
                       body = sanitizeForJson(aMimeMsg.coerceBodyToPlaintext());
                     } catch {
-                      body = "(Could not extract body text)";
+                      body = "";
+                    }
+
+                    // If plain text extraction failed, try to get HTML body from MIME parts
+                    if (!body) {
+                      try {
+                        function findBody(part) {
+                          if (part.parts) {
+                            for (const sub of part.parts) {
+                              const result = findBody(sub);
+                              if (result) return result;
+                            }
+                          }
+                          if (part.contentType === "text/html" && part.body) {
+                            return { text: part.body, isHtml: true };
+                          }
+                          if (part.contentType === "text/plain" && part.body) {
+                            return { text: part.body, isHtml: false };
+                          }
+                          return null;
+                        }
+                        const found = findBody(aMimeMsg);
+                        if (found) {
+                          body = sanitizeForJson(found.text);
+                          bodyIsHtml = found.isHtml;
+                        } else {
+                          body = "(Could not extract body text)";
+                        }
+                      } catch {
+                        body = "(Could not extract body text)";
+                      }
                     }
 
                     resolve({
@@ -544,7 +575,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       recipients: msgHdr.recipients,
                       ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      body
+                      body,
+                      bodyIsHtml
                     });
                   }, true, { examineEncryptedParts: true });
 
