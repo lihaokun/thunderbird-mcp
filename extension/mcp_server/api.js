@@ -148,6 +148,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath", "to"],
         },
       },
+      {
+        name: "markAsRead",
+        title: "Mark As Read",
+        description: "Mark one or more messages as read (or unread). Accepts a single message or an array of messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messages: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+                  folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+                },
+                required: ["messageId", "folderPath"],
+              },
+              description: "Array of {messageId, folderPath} objects to mark",
+            },
+            read: { type: "boolean", description: "Set to true to mark as read, false to mark as unread (default: true)" },
+          },
+          required: ["messages"],
+        },
+      },
     ];
 
     return {
@@ -392,6 +416,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                     const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                     const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
+                    const ccList = (msgHdr.ccList || "").toLowerCase();
                     const msgDateTs = msgHdr.date || 0;
 
                     if (startDateTs !== null && msgDateTs < startDateTs) continue;
@@ -400,14 +425,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (!hasQuery ||
                         subject.includes(lowerQuery) ||
                         author.includes(lowerQuery) ||
-                        recipients.includes(lowerQuery)) {
+                        recipients.includes(lowerQuery) ||
+                        ccList.includes(lowerQuery)) {
                       results.push({
                         id: msgHdr.messageId,
-                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
-                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                        subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
+                        author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
+                        recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                        ccList: sanitizeForJson(msgHdr.ccList),
                         date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                        folder: folder.prettyName,
+                        folder: sanitizeForJson(folder.prettyName),
                         folderPath: folder.URI,
                         read: msgHdr.isRead,
                         flagged: msgHdr.isFlagged,
@@ -530,21 +557,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     let body = "";
+                    let bodyIsHtml = false;
                     try {
                       // sanitizeForJson removes control chars that break JSON
                       body = sanitizeForJson(aMimeMsg.coerceBodyToPlaintext());
                     } catch {
-                      body = "(Could not extract body text)";
+                      body = "";
+                    }
+
+                    // If plain text extraction failed, try to get HTML body from MIME parts
+                    if (!body) {
+                      try {
+                        function findBody(part) {
+                          if (part.parts) {
+                            for (const sub of part.parts) {
+                              const result = findBody(sub);
+                              if (result) return result;
+                            }
+                          }
+                          if (part.contentType === "text/html" && part.body) {
+                            return { text: part.body, isHtml: true };
+                          }
+                          if (part.contentType === "text/plain" && part.body) {
+                            return { text: part.body, isHtml: false };
+                          }
+                          return null;
+                        }
+                        const found = findBody(aMimeMsg);
+                        if (found) {
+                          body = sanitizeForJson(found.text);
+                          bodyIsHtml = found.isHtml;
+                        } else {
+                          body = "(Could not extract body text)";
+                        }
+                      } catch {
+                        body = "(Could not extract body text)";
+                      }
                     }
 
                     resolve({
                       id: msgHdr.messageId,
-                      subject: msgHdr.subject,
-                      author: msgHdr.author,
-                      recipients: msgHdr.recipients,
-                      ccList: msgHdr.ccList,
+                      subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
+                      author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
+                      recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                      ccList: sanitizeForJson(msgHdr.ccList),
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      body
+                      body,
+                      bodyIsHtml
                     });
                   }, true, { examineEncryptedParts: true });
 
@@ -878,6 +937,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function markAsRead(messages, read) {
+              const markRead = read !== false; // default true
+              const results = [];
+              for (const { messageId, folderPath } of messages) {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    results.push({ messageId, folderPath, error: "Folder not found" });
+                    continue;
+                  }
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    results.push({ messageId, folderPath, error: "Could not access folder database" });
+                    continue;
+                  }
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+                  if (!msgHdr) {
+                    results.push({ messageId, folderPath, error: "Message not found" });
+                    continue;
+                  }
+                  msgHdr.markRead(markRead);
+                  results.push({ messageId, folderPath, success: true, read: markRead });
+                } catch (e) {
+                  results.push({ messageId, folderPath, error: e.toString() });
+                }
+              }
+              return results;
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -896,6 +990,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
+                case "markAsRead":
+                  return markAsRead(args.messages || [], args.read);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
