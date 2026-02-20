@@ -6,7 +6,7 @@
 
 > Inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp). Rewritten from scratch with a bundled HTTP server, proper MIME decoding, and UTF-8 handling throughout.
 
-An MCP server that lets you read email, search contacts, and draft replies in Thunderbird.
+An MCP server that lets AI assistants read email, manage calendars, and compose messages in Thunderbird.
 
 ## How it works
 
@@ -46,12 +46,17 @@ Example for `~/.claude.json`:
 
 | Tool | What it does |
 |------|--------------|
-| `searchMessages` | Find emails by subject, sender, or recipient |
-| `getMessage` | Read full email content |
+| `listAccounts` | List all email accounts and their identities |
+| `listFolders` | List all mail folders with message counts |
+| `searchMessages` | Find emails by subject, sender, recipient, or date range |
+| `getMessage` | Read full email content with optional attachment saving |
+| `updateMessage` | Mark read/unread, flag/unflag, move to folder, or trash |
+| `sendMail` | Open a compose window with pre-filled content |
+| `replyToMessage` | Reply with quoted original and proper threading |
+| `forwardMessage` | Forward with original attachments preserved |
 | `searchContacts` | Look up contacts |
 | `listCalendars` | List your calendars |
-| `sendMail` | Open a compose window with pre-filled content |
-| `replyToMessage` | Open a reply with proper threading |
+| `createEvent` | Open a pre-filled calendar event dialog |
 
 Compose tools open a window for you to review before sending. Nothing gets sent automatically.
 
@@ -89,9 +94,9 @@ After changing extension code, you'll need to remove it from Thunderbird, restar
 
 ## Known issues
 
-- Replies don't include the quoted original message (Thunderbird limitation workaround)
 - IMAP folder databases can be stale until you click on them
-- Email bodies with weird control characters get sanitized to avoid breaking JSON
+- Email bodies with control characters get sanitized to avoid breaking JSON
+- HTML-only emails are converted to plain text (original formatting is lost)
 
 ## Project structure
 
