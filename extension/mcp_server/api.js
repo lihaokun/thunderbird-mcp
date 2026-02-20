@@ -42,6 +42,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
+        name: "listFolders",
+        title: "List Folders",
+        description: "List all mail folders with URIs and message counts",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
+          },
+          required: [],
+        },
+      },
+      {
         name: "searchMessages",
         title: "Search Mail",
         description: "Search message headers and return IDs/folder paths you can use with getMessage to read full email content",
@@ -311,6 +323,79 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
               }
               return accounts;
+            }
+
+            /**
+             * Lists all folders (optionally limited to a single account).
+             * Depth is 0 for root children, increasing for subfolders.
+             */
+            function listFolders(accountId) {
+              const results = [];
+
+              function walkFolder(folder, accountKey, depth) {
+                try {
+                  results.push({
+                    name: sanitizeForJson(folder.prettyName),
+                    path: folder.URI,
+                    accountId: accountKey,
+                    totalMessages: folder.getTotalMessages(false),
+                    unreadMessages: folder.getNumUnread(false),
+                    depth
+                  });
+                } catch {
+                  // Skip inaccessible folders
+                }
+
+                try {
+                  if (folder.hasSubFolders) {
+                    for (const subfolder of folder.subFolders) {
+                      walkFolder(subfolder, accountKey, depth + 1);
+                    }
+                  }
+                } catch {
+                  // Skip subfolder traversal errors
+                }
+              }
+
+              if (accountId) {
+                let target = null;
+                for (const account of MailServices.accounts.accounts) {
+                  if (account.key === accountId) {
+                    target = account;
+                    break;
+                  }
+                }
+                if (!target) {
+                  return { error: `Account not found: ${accountId}` };
+                }
+                try {
+                  const root = target.incomingServer.rootFolder;
+                  if (root && root.hasSubFolders) {
+                    for (const subfolder of root.subFolders) {
+                      walkFolder(subfolder, target.key, 0);
+                    }
+                  }
+                } catch {
+                  // Skip inaccessible account
+                }
+                return results;
+              }
+
+              for (const account of MailServices.accounts.accounts) {
+                try {
+                  const root = account.incomingServer.rootFolder;
+                  if (!root) continue;
+                  if (root.hasSubFolders) {
+                    for (const subfolder of root.subFolders) {
+                      walkFolder(subfolder, account.key, 0);
+                    }
+                  }
+                } catch {
+                  // Skip inaccessible accounts/folders
+                }
+              }
+
+              return results;
             }
 
             /**
@@ -1269,6 +1354,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               switch (name) {
                 case "listAccounts":
                   return listAccounts();
+                case "listFolders":
+                  return listFolders(args.accountId);
                 case "searchMessages":
                   return searchMessages(args.query || "", args.startDate, args.endDate, args.maxResults, args.sortOrder);
                 case "getMessage":
