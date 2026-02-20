@@ -379,12 +379,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Sets compose identity from `from` param or falls back to default.
              * Returns warning string if `from` was specified but not found.
              */
-            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
-              const identity = findIdentity(from);
-              if (identity) {
-                msgComposeParams.identity = identity;
-                return "";
-              }
+	            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
+	              const identity = findIdentity(from);
+	              if (identity) {
+	                msgComposeParams.identity = identity;
+	                return "";
+	              }
               // Fallback to default identity for the account
               if (fallbackServer) {
                 const account = MailServices.accounts.findAccountForServer(fallbackServer);
@@ -393,14 +393,83 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const defaultAccount = MailServices.accounts.defaultAccount;
                 if (defaultAccount) msgComposeParams.identity = defaultAccount.defaultIdentity;
               }
-              return from ? `unknown identity: ${from}, using default` : "";
-            }
+	              return from ? `unknown identity: ${from}, using default` : "";
+	            }
 
-            function searchMessages(query, startDate, endDate, maxResults, sortOrder) {
-              const results = [];
-              const lowerQuery = (query || "").toLowerCase();
-              const hasQuery = !!lowerQuery;
-              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
+	            /**
+	             * Opens a folder and its message database.
+	             * Best-effort refresh for IMAP folders (db may be stale).
+	             * Returns { folder, db } or { error }.
+	             */
+	            function openFolder(folderPath) {
+	              try {
+	                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+	                if (!folder) {
+	                  return { error: `Folder not found: ${folderPath}` };
+	                }
+
+	                // Attempt to refresh IMAP folders. This is async and may not
+	                // complete before we read, but helps with stale data.
+	                if (folder.server && folder.server.type === "imap") {
+	                  try {
+	                    folder.updateFolder(null);
+	                  } catch {
+	                    // updateFolder may fail, continue anyway
+	                  }
+	                }
+
+	                const db = folder.msgDatabase;
+	                if (!db) {
+	                  return { error: "Could not access folder database" };
+	                }
+
+	                return { folder, db };
+	              } catch (e) {
+	                return { error: e.toString() };
+	              }
+	            }
+
+	            /**
+	             * Finds a single message header by messageId within a folderPath.
+	             * Returns { msgHdr, folder, db } or { error }.
+	             */
+	            function findMessage(messageId, folderPath) {
+	              const opened = openFolder(folderPath);
+	              if (opened.error) return opened;
+
+	              const { folder, db } = opened;
+	              let msgHdr = null;
+
+	              const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
+	              if (hasDirectLookup) {
+	                try {
+	                  msgHdr = db.getMsgHdrForMessageID(messageId);
+	                } catch {
+	                  msgHdr = null;
+	                }
+	              }
+
+	              if (!msgHdr) {
+	                for (const hdr of db.enumerateMessages()) {
+	                  if (hdr.messageId === messageId) {
+	                    msgHdr = hdr;
+	                    break;
+	                  }
+	                }
+	              }
+
+	              if (!msgHdr) {
+	                return { error: `Message not found: ${messageId}` };
+	              }
+
+	              return { msgHdr, folder, db };
+	            }
+
+	            function searchMessages(query, startDate, endDate, maxResults, sortOrder) {
+	              const results = [];
+	              const lowerQuery = (query || "").toLowerCase();
+	              const hasQuery = !!lowerQuery;
+	              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
               const parsedEndDate = endDate ? new Date(endDate).getTime() : NaN;
               const startDateTs = Number.isFinite(parsedStartDate) ? parsedStartDate * 1000 : null;
               // Add 24h only for date-only strings (no time component) to include the full day
@@ -672,37 +741,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function getMessage(messageId, folderPath) {
-              return new Promise((resolve) => {
-                try {
-                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                  if (!folder) {
-                    resolve({ error: `Folder not found: ${folderPath}` });
-                    return;
-                  }
+	            function getMessage(messageId, folderPath) {
+	              return new Promise((resolve) => {
+	                try {
+	                  const found = findMessage(messageId, folderPath);
+	                  if (found.error) {
+	                    resolve({ error: found.error });
+	                    return;
+	                  }
+	                  const { msgHdr } = found;
 
-                  const db = folder.msgDatabase;
-                  if (!db) {
-                    resolve({ error: "Could not access folder database" });
-                    return;
-                  }
-
-                  let msgHdr = null;
-                  for (const hdr of db.enumerateMessages()) {
-                    if (hdr.messageId === messageId) {
-                      msgHdr = hdr;
-                      break;
-                    }
-                  }
-
-                  if (!msgHdr) {
-                    resolve({ error: `Message not found: ${messageId}` });
-                    return;
-                  }
-
-                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                    "resource:///modules/gloda/MimeMessage.sys.mjs"
-                  );
+	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+	                  );
 
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                     if (!aMimeMsg) {
@@ -884,37 +935,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * builds the quoted original message text. Threading is maintained
              * via the References and In-Reply-To headers.
              */
-            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments) {
-              return new Promise((resolve) => {
-                try {
-                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                  if (!folder) {
-                    resolve({ error: `Folder not found: ${folderPath}` });
-                    return;
-                  }
+	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments) {
+	              return new Promise((resolve) => {
+	                try {
+	                  const found = findMessage(messageId, folderPath);
+	                  if (found.error) {
+	                    resolve({ error: found.error });
+	                    return;
+	                  }
+	                  const { msgHdr, folder } = found;
 
-                  const db = folder.msgDatabase;
-                  if (!db) {
-                    resolve({ error: "Could not access folder database" });
-                    return;
-                  }
-
-                  let msgHdr = null;
-                  for (const hdr of db.enumerateMessages()) {
-                    if (hdr.messageId === messageId) {
-                      msgHdr = hdr;
-                      break;
-                    }
-                  }
-
-                  if (!msgHdr) {
-                    resolve({ error: `Message not found: ${messageId}` });
-                    return;
-                  }
-
-                  // Fetch original message body for quoting
-                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+	                  // Fetch original message body for quoting
+	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
 
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
@@ -1021,37 +1054,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Opens a forward compose window with attachments preserved.
              * Uses New type with manual forward quote to preserve both intro body and forwarded content.
              */
-            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments) {
-              return new Promise((resolve) => {
-                try {
-                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                  if (!folder) {
-                    resolve({ error: `Folder not found: ${folderPath}` });
-                    return;
-                  }
+	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments) {
+	              return new Promise((resolve) => {
+	                try {
+	                  const found = findMessage(messageId, folderPath);
+	                  if (found.error) {
+	                    resolve({ error: found.error });
+	                    return;
+	                  }
+	                  const { msgHdr, folder } = found;
 
-                  const db = folder.msgDatabase;
-                  if (!db) {
-                    resolve({ error: "Could not access folder database" });
-                    return;
-                  }
-
-                  let msgHdr = null;
-                  for (const hdr of db.enumerateMessages()) {
-                    if (hdr.messageId === messageId) {
-                      msgHdr = hdr;
-                      break;
-                    }
-                  }
-
-                  if (!msgHdr) {
-                    resolve({ error: `Message not found: ${messageId}` });
-                    return;
-                  }
-
-                  // Get attachments and body from original message
-                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+	                  // Get attachments and body from original message
+	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
 
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
@@ -1182,35 +1197,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 messagesByFolder.get(folderPath).push({ index: i, messageId, folderPath });
               }
 
-              for (const [folderPath, items] of messagesByFolder) {
-                try {
-                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                  if (!folder) {
-                    for (const { index, messageId } of items) {
-                      results[index] = { messageId, folderPath, error: "Folder not found" };
-                    }
-                    continue;
-                  }
+	              for (const [folderPath, items] of messagesByFolder) {
+	                try {
+	                  const opened = openFolder(folderPath);
+	                  if (opened.error) {
+	                    for (const { index, messageId } of items) {
+	                      const error = opened.error.startsWith("Folder not found") ? "Folder not found" : opened.error;
+	                      results[index] = { messageId, folderPath, error };
+	                    }
+	                    continue;
+	                  }
 
-                  // Best-effort refresh for IMAP folders (db may be stale)
-                  if (folder.server && folder.server.type === "imap") {
-                    try {
-                      folder.updateFolder(null);
-                    } catch {
-                      // ignore refresh failures
-                    }
-                  }
+	                  const { db } = opened;
 
-                  const db = folder.msgDatabase;
-                  if (!db) {
-                    for (const { index, messageId } of items) {
-                      results[index] = { messageId, folderPath, error: "Could not access folder database" };
-                    }
-                    continue;
-                  }
-
-                  const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
-                  let hdrMap = null;
+	                  const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
+	                  let hdrMap = null;
 
                   for (const entry of items) {
                     let msgHdr = null;
