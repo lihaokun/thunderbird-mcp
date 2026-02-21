@@ -1546,6 +1546,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function deleteMessages(messageIds, folderPath) {
               try {
+                // MCP clients may send arrays as JSON strings
+                if (typeof messageIds === "string") {
+                  try { messageIds = JSON.parse(messageIds); } catch { /* leave as-is */ }
+                }
                 if (!Array.isArray(messageIds) || messageIds.length === 0) {
                   return { error: "messageIds must be a non-empty array of strings" };
                 }
@@ -1643,17 +1647,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "folderPath must be a non-empty string" };
                 }
 
-                if (read !== undefined && typeof read !== "boolean") {
-                  return { error: "read must be a boolean" };
-                }
-                if (flagged !== undefined && typeof flagged !== "boolean") {
-                  return { error: "flagged must be a boolean" };
-                }
+                // Coerce boolean params (MCP clients may send strings)
+                if (read !== undefined) read = read === true || read === "true";
+                if (flagged !== undefined) flagged = flagged === true || flagged === "true";
+                if (trash !== undefined) trash = trash === true || trash === "true";
                 if (moveTo !== undefined && (typeof moveTo !== "string" || !moveTo)) {
                   return { error: "moveTo must be a non-empty string" };
-                }
-                if (trash !== undefined && typeof trash !== "boolean") {
-                  return { error: "trash must be a boolean" };
                 }
 
                 if (moveTo && trash === true) {
