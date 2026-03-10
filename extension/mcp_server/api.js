@@ -19,8 +19,8 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8765;
-// Keep a reference to the attach timer to prevent GC before it fires.
-let _attachTimer = null;
+// Keep references to active attach timers to prevent GC before they fire.
+const _attachTimers = new Set();
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -555,31 +555,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Adds file attachments to compose fields.
-             * Returns { added: number, failed: string[] } for failure reporting.
+             * Converts local file paths to attachment descriptors, validating existence upfront.
+             * Returns { descs: [{url, name, size}], failed: string[] }
+             * Failed paths are reported synchronously in the tool response.
              */
-            function addAttachments(composeFields, attachments) {
-              const result = { added: 0, failed: [] };
-              if (!attachments || !Array.isArray(attachments)) return result;
-              for (const filePath of attachments) {
+            function filePathsToAttachDescs(filePaths) {
+              const descs = [];
+              const failed = [];
+              if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
+              for (const filePath of filePaths) {
                 try {
                   const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
                   file.initWithPath(filePath);
                   if (file.exists()) {
-                    const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
-                      .createInstance(Ci.nsIMsgAttachment);
-                    attachment.url = Services.io.newFileURI(file).spec;
-                    attachment.name = file.leafName;
-                    composeFields.addAttachment(attachment);
-                    result.added++;
+                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
                   } else {
-                    result.failed.push(filePath);
+                    failed.push(filePath);
                   }
                 } catch {
-                  result.failed.push(filePath);
+                  failed.push(filePath);
                 }
               }
-              return result;
+              return { descs, failed };
+            }
+
+            /**
+             * Injects attachment descriptors into the most recently opened compose window.
+             * Uses nsITimer so the window has time to finish loading before injection.
+             * Each call gets its own timer stored in _attachTimers to prevent GC.
+             * attachDescs: array of { url, name, size?, contentType? }
+             */
+            function injectAttachmentsAsync(attachDescs) {
+              if (!attachDescs || attachDescs.length === 0) return;
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              _attachTimers.add(timer);
+              timer.initWithCallback({
+                notify() {
+                  _attachTimers.delete(timer);
+                  try {
+                    const composeWin = Services.wm.getMostRecentWindow("msgcompose");
+                    if (!composeWin || typeof composeWin.AddAttachments !== "function") return;
+                    const attachList = [];
+                    for (const desc of attachDescs) {
+                      try {
+                        const att = Cc["@mozilla.org/messengercompose/attachment;1"]
+                          .createInstance(Ci.nsIMsgAttachment);
+                        att.url = desc.url;
+                        att.name = desc.name;
+                        if (desc.size != null) att.size = desc.size;
+                        if (desc.contentType) att.contentType = desc.contentType;
+                        attachList.push(att);
+                      } catch {}
+                    }
+                    if (attachList.length > 0) {
+                      composeWin.AddAttachments(attachList);
+                    }
+                  } catch(e) {}
+                }
+              }, 1500, Ci.nsITimer.TYPE_ONE_SHOT);
             }
 
             function escapeHtml(s) {
@@ -1340,45 +1373,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const identityWarning = setComposeIdentity(msgComposeParams, from, null);
 
+                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
-                // Inject attachments after compose window has loaded.
-                // composeFields.addAttachment() before OpenComposeWindowWithParams is
-                // silently dropped on nsIMsgCompType.New; use nsITimer + getMostRecentWindow
-                // to add them after the window is ready (setTimeout not available in XPCOM context).
-                if (attachments && attachments.length > 0) {
-                  _attachTimer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  _attachTimer.initWithCallback({
-                    notify() {
-                      try {
-                        const composeWin = Services.wm.getMostRecentWindow("msgcompose");
-                        if (!composeWin) return;
-                        const attachList = [];
-                        for (const filePath of attachments) {
-                          try {
-                            const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                            file.initWithPath(filePath);
-                            if (file.exists()) {
-                              const att = Cc["@mozilla.org/messengercompose/attachment;1"]
-                                .createInstance(Ci.nsIMsgAttachment);
-                              att.url = Services.io.newFileURI(file).spec;
-                              att.name = file.leafName;
-                              att.size = file.fileSize;
-                              attachList.push(att);
-                            }
-                          } catch {}
-                        }
-                        if (attachList.length > 0 && typeof composeWin.AddAttachments === "function") {
-                          composeWin.AddAttachments(attachList);
-                        }
-                      } catch(e) {}
-                      _attachTimer = null;
-                    }
-                  }, 1500, Ci.nsITimer.TYPE_ONE_SHOT);
-                }
+                injectAttachmentsAsync(fileDescs);
 
                 let msg = "Compose window opened";
                 if (identityWarning) msg += ` (${identityWarning})`;
+                if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                 return { success: true, message: msg };
               } catch (e) {
                 return { error: e.toString() };
@@ -1479,8 +1482,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
 
-                      // Add file attachments
-                      const attResult = addAttachments(composeFields, attachments);
+                      const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
                       msgComposeParams.type = Ci.nsIMsgCompType.New;
                       msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
@@ -1490,11 +1492,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
+                      injectAttachmentsAsync(fileDescs);
+
                       let msg = "Reply window opened";
                       if (identityWarning) msg += ` (${identityWarning})`;
-                      if (attResult.failed.length > 0) {
-                        msg += ` (failed to attach: ${attResult.failed.join(", ")})`;
-                      }
+                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       resolve({ success: true, message: msg });
                     } catch (e) {
                       resolve({ error: e.toString() });
@@ -1573,26 +1575,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
 
-                      // Copy attachments from original message
-                      let origAttCount = 0;
+                      // Collect original message attachments as descriptors
+                      const origDescs = [];
                       if (aMimeMsg && aMimeMsg.allUserAttachments) {
                         for (const att of aMimeMsg.allUserAttachments) {
                           try {
-                            const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
-                              .createInstance(Ci.nsIMsgAttachment);
-                            attachment.url = att.url;
-                            attachment.name = att.name;
-                            attachment.contentType = att.contentType;
-                            composeFields.addAttachment(attachment);
-                            origAttCount++;
+                            origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
                           } catch {
                             // Skip unreadable original attachments
                           }
                         }
                       }
 
-                      // Add user-specified file attachments
-                      const attResult = addAttachments(composeFields, attachments);
+                      // Validate user-specified file attachments
+                      const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
                       // Use New type - we build forward quote manually
                       msgComposeParams.type = Ci.nsIMsgCompType.New;
@@ -1603,11 +1599,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
-                      let msg = `Forward window opened with ${origAttCount + attResult.added} attachment(s)`;
+                      injectAttachmentsAsync([...origDescs, ...fileDescs]);
+
+                      let msg = `Forward window opened with ${origDescs.length + fileDescs.length} attachment(s)`;
                       if (identityWarning) msg += ` (${identityWarning})`;
-                      if (attResult.failed.length > 0) {
-                        msg += ` (failed to attach: ${attResult.failed.join(", ")})`;
-                      }
+                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       resolve({ success: true, message: msg });
                     } catch (e) {
                       resolve({ error: e.toString() });
